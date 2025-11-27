@@ -44,27 +44,28 @@ endif
 ##---------------------------------------------------------------------
 
 build/%.o: %.cpp | build
-	$(info $@)
-	$(CXX) $(CXXFLAGS) -c -o $@ $<
+	$(info CXX $<)
+	@$(CXX) $(CXXFLAGS) -c -o $@ $<
 
 build/%.o: $(IMGUI_DIR)/%.cpp | build
-	$(info $@)
-	$(CXX) $(CXXFLAGS) -c -o $@ $<
+	$(info CXX $<)
+	@$(CXX) $(CXXFLAGS) -c -o $@ $<
 
 build/%.o: $(IMGUI_DIR)/backends/%.cpp | build
-	$(info $@)
-	$(CXX) $(CXXFLAGS) -c -o $@ $<
+	$(info CXX $<)
+	@$(CXX) $(CXXFLAGS) -c -o $@ $<
 
 all: $(EXE)
 
 run: $(EXE)
-	$(EXE)
+	@$(EXE)
 
 build:
 	mkdir build
 
 $(EXE): $(OBJS) | build
-	$(CXX) -o $@ $^ $(CXXFLAGS) $(LIBS)
+	$(info CXX EXE)
+	@$(CXX) -o $@ $^ $(CXXFLAGS) $(LIBS)
 
 clean:
 	rm -rf build
