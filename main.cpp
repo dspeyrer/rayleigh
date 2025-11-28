@@ -57,7 +57,7 @@ struct Params {
     // The exterior bound of the atmosphere.
     double atmos_bound;
     // The step size of the rays.
-    double view_step, sun_step;
+    double view_step, sun_step, step_scale;
     // The sun angle
     double sun_azimuth, sun_altitude;
     // The camera options.
@@ -69,6 +69,7 @@ struct Params {
 
         view_step = 0.001;
         sun_step = 0.001;
+        step_scale = 0;
 
         sun_azimuth = 270;
         sun_altitude = 45;
@@ -82,8 +83,6 @@ struct Params {
 struct Derived {
     // The normalized sun vector.
     Vec3 sun;
-    // The sun step vector.
-    Vec3 sun_step;
     // The squared bound.
     double b_sq;
 
@@ -94,8 +93,6 @@ struct Derived {
         sun.x = cos(alt) * cos(azi);
         sun.y = cos(alt) * sin(azi);
         sun.z = sin(alt);
-
-        sun_step = sun * p.sun_step;
 
         b_sq = p.atmos_bound * p.atmos_bound;
     }
@@ -148,8 +145,8 @@ static double compute(Params& p, Derived& d, double gain, double x, double y) {
             intensity.add(0, view_step);
         } else {
             integrator in;
-
             Vec3 w = v;
+            double sun_step = 0;
 
             while (true) {
                 double ww = w*w;
@@ -157,11 +154,12 @@ static double compute(Params& p, Derived& d, double gain, double x, double y) {
                 double in_h = in_r - 1;
                 double in_rho = exp(-in_h / params.scale_height);
                 
-                in.add(in_rho, p.sun_step);
+                in.add(in_rho, sun_step);
 
                 if (in_r >= p.atmos_bound) break;
 
-                w = w + d.sun_step;
+                sun_step = p.sun_step * exp(p.step_scale * in_h);
+                w = w + d.sun * sun_step;
             }
 
             intensity.add(view_rho * exp(gain * -(in.acc + density.acc)), view_step);
@@ -169,7 +167,7 @@ static double compute(Params& p, Derived& d, double gain, double x, double y) {
 
         if (z == zf) break;
 
-        view_step = p.view_step;
+        view_step = p.view_step * exp(p.step_scale * view_h);
         double zn = z - view_step;
 
         if (zn <= zf) {
@@ -320,8 +318,9 @@ SDL_AppResult SDL_AppIterate(void *appstate) {
     
     dirty |= ImGui::SliderDouble("Scale height", &params.scale_height, 0.0, 0.01, "%.6f");
     dirty |= ImGui::SliderDouble("Atmosphere bound", &params.atmos_bound, 1.0, 1.5);
-    dirty |= ImGui::SliderDouble("View step", &params.view_step, 1e-3, 1.0);
-    dirty |= ImGui::SliderDouble("Sun step", &params.sun_step, 1e-3, 1.0);
+    dirty |= ImGui::SliderDouble("View step", &params.view_step, 1e-4, 1.0);
+    dirty |= ImGui::SliderDouble("Sun step", &params.sun_step, 1e-4, 1.0);
+    dirty |= ImGui::SliderDouble("Step scale", &params.step_scale, 0.0, 5.0);
     dirty |= ImGui::SliderDouble("Sun azimuth", &params.sun_azimuth, 0, 360.0);
     dirty |= ImGui::SliderDouble("Sun altitude", &params.sun_altitude, -90.0, 90.0);
     dirty |= ImGui::SliderDouble("Camera X", &params.cx, -2.0, 2.0);
