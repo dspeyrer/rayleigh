@@ -8,6 +8,9 @@
 
 #include <algorithm>
 #include <optional>
+#include <mutex>
+#include <condition_variable>
+#include <thread>
 
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_main.h>
@@ -22,8 +25,8 @@ namespace ImGui {
     }
 }
 
-constexpr int w = 1080;
-constexpr int h = 720;
+constexpr int w = 200;
+constexpr int h = 400;
 
 struct Vec3 {
     double x, y, z;
@@ -72,11 +75,11 @@ struct Params {
         step_scale = 0;
 
         sun_azimuth = 270;
-        sun_altitude = 45;
+        sun_altitude = 0;
 
-        cx = 0.0;
+        cx = 1.0;
         cy = 0.0;
-        zoom = 12.3;
+        zoom = 13.0;
     }
 };
 
@@ -110,8 +113,15 @@ struct integrator {
     }
 };
 
+static size_t prev_head;
+
+static std::mutex m;
+static std::condition_variable cv;
 static bool dirty = true;
 static Params params;
+
+static std::atomic<size_t> head;
+static uint8_t buffer[h][w][3];
 
 static double compute(Params& p, Derived& d, double gain, double x, double y) {
     double bound_h_sq = d.b_sq - x * x - y * y;
@@ -181,6 +191,47 @@ static double compute(Params& p, Derived& d, double gain, double x, double y) {
     return gain * intensity.acc;
 }
 
+void worker() {
+    double rs = 10e-26 * pow(760e-9, -4.);
+    double gs = 10e-26 * pow(555e-9, -4.);
+    double bs = 10e-26 * pow(495e-9, -4.);
+    
+    while (true) {
+        std::unique_lock lk(m);
+        cv.wait(lk, []{ return dirty; });
+
+        Params p = params;
+
+        dirty = false;
+        head.store(0, std::memory_order_relaxed);
+
+        lk.unlock();
+
+        Derived d(p);
+
+        double pixel_zoom = std::min(w, h) / exp(p.zoom);
+
+        size_t off = 0;
+
+        while (true) {
+            int i = off / w;
+            int j = off % w;
+
+            double y = p.cy + pixel_zoom * (i - h / 2);
+            double x = p.cx + pixel_zoom * (j - w / 2);
+
+            buffer[i][j][0] = std::min(compute(p, d, rs, x, y) * 5000, 255.);
+            buffer[i][j][1] = std::min(compute(p, d, gs, x, y) * 5000, 255.);
+            buffer[i][j][2] = std::min(compute(p, d, bs, x, y) * 5000, 255.);
+
+            size_t prev = head.exchange(++off, std::memory_order_release);
+            
+            if (off >= w * h) break;
+            if (prev == SIZE_MAX) break;
+        }
+    }
+}
+
 ImVec4 clear_color = ImVec4(0, 0, 0, 1);
 
 SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
@@ -227,6 +278,11 @@ SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
 
     tex = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_RGB24, SDL_TEXTUREACCESS_STREAMING, w, h);
 
+    std::thread w(worker);
+    w.detach();
+
+    cv.notify_one();
+
     return SDL_APP_CONTINUE;
 }
 
@@ -250,38 +306,26 @@ SDL_AppResult SDL_AppIterate(void *appstate) {
         return SDL_APP_CONTINUE;
     }
 
-    uint8_t* pixels = nullptr;
-    int pitch = -1;
+    size_t cur_head = head.load(std::memory_order_acquire);
 
-    SDL_LockTexture(tex, NULL, (void**)&pixels, &pitch);
+    if (cur_head > prev_head) {
+        uint8_t* pixels = nullptr;
+        int pitch = -1;
 
-    
-    if (dirty) {
-        double rs = 10e-26 * pow(760e-9, -4.);
-        double gs = 10e-26 * pow(555e-9, -4.);
-        double bs = 10e-26 * pow(495e-9, -4.);
+        SDL_LockTexture(tex, NULL, (void**)&pixels, &pitch);
+        
+        for (int off = prev_head; off < cur_head; off++) {
+            int i = off / w;
+            int j = off % w;
 
-        double pixel_zoom = std::min(w, h) / exp(params.zoom);
-
-        Derived d(params);
-
-        for (int i = 0; i < w; i++) {
-            for (int j = 0; j < h; j++) {
-                double x = params.cx + pixel_zoom * (i - w / 2);
-                double y = params.cy + pixel_zoom * (j - h / 2);
-                
-                size_t off = (i + j * w) * 3;
-
-                pixels[off++] = std::min(compute(params, d, rs, x, y) * 5000, 255.);
-                pixels[off++] = std::min(compute(params, d, gs, x, y) * 5000, 255.);
-                pixels[off++] = std::min(compute(params, d, bs, x, y) * 5000, 255.);
-            }
+            for (int c = 0; c < 3; c++)
+                pixels[i*pitch + j*3 + c] = buffer[i][j][c];
         }
 
-        dirty = false;
-    }
+        SDL_UnlockTexture(tex);
 
-    SDL_UnlockTexture(tex);
+        prev_head = cur_head;
+    }
 
     SDL_Rect view;
     SDL_GetRenderViewport(renderer, &view);
@@ -316,6 +360,8 @@ SDL_AppResult SDL_AppIterate(void *appstate) {
     
     ImGui::Begin("Parameters");
     
+    std::unique_lock lk(m);
+
     dirty |= ImGui::SliderDouble("Scale height", &params.scale_height, 0.0, 0.01, "%.6f");
     dirty |= ImGui::SliderDouble("Atmosphere bound", &params.atmos_bound, 1.0, 1.5);
     dirty |= ImGui::SliderDouble("View step", &params.view_step, 1e-4, 1.0);
@@ -326,6 +372,16 @@ SDL_AppResult SDL_AppIterate(void *appstate) {
     dirty |= ImGui::SliderDouble("Camera X", &params.cx, -2.0, 2.0);
     dirty |= ImGui::SliderDouble("Camera Y", &params.cy, -2.0, 2.0);
     dirty |= ImGui::SliderDouble("Zoom", &params.zoom, 0.0, 20.0);
+
+    if (dirty) {
+        cv.notify_one();
+        head.store(SIZE_MAX, std::memory_order_relaxed);
+        prev_head = 0;
+    }
+
+    lk.unlock();
+
+    ImGui::ProgressBar((float) cur_head / (w * h));
 
     ImGui::End();
 
