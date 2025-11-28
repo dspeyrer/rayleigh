@@ -7,6 +7,7 @@
 #include "imgui_impl_sdlrenderer3.h"
 
 #include <algorithm>
+#include <optional>
 
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_main.h>
@@ -24,28 +25,99 @@ namespace ImGui {
 constexpr int w = 1080;
 constexpr int h = 720;
 
+struct Vec3 {
+    double x, y, z;
+
+    Vec3() {
+        x = y = z = 0;
+    }
+
+    Vec3(double x, double y, double z) {
+        this->x = x;
+        this->y = y;
+        this->z = z;
+    }
+
+    auto operator+(const Vec3& other) const {
+        return Vec3 { this->x + other.x, this->y + other.y, this->z + other.z };
+    }
+    
+    auto operator*(const Vec3& other) const {
+        return this->x * other.x + this->y * other.y + this->z * other.z;
+    }
+    
+    auto operator*(double scalar) const {
+        return Vec3 { this->x * scalar, this->y * scalar, this->z * scalar };
+    }
+};
+
 struct Params {
     // The atmosphere scale height.
     double scale_height;
     // The exterior bound of the atmosphere.
     double atmos_bound;
+    // The step size of the rays.
+    double view_step, sun_step;
+    // The sun angle
+    double sun_azimuth, sun_altitude;
     // The camera options.
     double cx, cy, zoom;
 
     Params() {
         scale_height = 7994. / 6.3781e6;
-        atmos_bound = 1.25;
+        atmos_bound = 1.01;
+
+        view_step = 0.01;
+        sun_step = 0.1;
+
+        sun_azimuth = 270;
+        sun_altitude = 45;
+
         cx = 0.0;
         cy = 0.0;
         zoom = 12.0;
     }
 };
 
+struct Derived {
+    // The normalized sun vector.
+    Vec3 sun;
+    // The sun step vector.
+    Vec3 sun_step;
+    // The squared bound.
+    double b_sq;
+
+    Derived(Params& p) {
+        double azi = p.sun_azimuth * M_PI / 180;
+        double alt = p.sun_altitude * M_PI / 180;
+
+        sun.x = cos(alt) * cos(azi);
+        sun.y = cos(alt) * sin(azi);
+        sun.z = sin(alt);
+
+        sun_step = sun * p.sun_step;
+
+        b_sq = p.atmos_bound * p.atmos_bound;
+    }
+};
+
+struct integrator {
+    double acc = 0;
+    std::optional<double> prev;
+
+    void add(double val, double step) {
+        if (prev)
+            acc += (*prev + val) / 2 * step;
+
+        prev = val;
+    }
+};
+
 static bool dirty = true;
 static Params params;
 
-static void compute(Params& p, double x, double y, uint8_t& r, uint8_t& g, uint8_t& b) {
-    double bound_h_sq = p.atmos_bound * p.atmos_bound - x * x - y * y;
+static void compute(Params& p, Derived& d, double x, double y, uint8_t& r, uint8_t& g, uint8_t& b) {
+    double bound_h_sq = d.b_sq - x * x - y * y;
     
     if (bound_h_sq < 0) {
         r = g = b = 0;
@@ -56,10 +128,67 @@ static void compute(Params& p, double x, double y, uint8_t& r, uint8_t& g, uint8
     
     bool hit = planet_h_sq >= 0;
 
-    double zi = sqrt(bound_h_sq);
-    double zf = hit ? sqrt(planet_h_sq) : -zi;
+    double z = sqrt(bound_h_sq);
+    double zf = hit ? sqrt(planet_h_sq) : -z;
 
-    r = g = b = (zi - zf) / 2 / p.atmos_bound * 255;
+    integrator density;
+    integrator intensity;
+
+    do {
+        // Step along the view ray
+        double view_step = p.view_step;
+        double zn = z - view_step;
+
+        if (zn <= zf) {
+            zn = zf;
+            view_step = z - zn;
+        }
+
+        z = zn;
+
+        Vec3 v(x, y, z);
+
+        // Evaluate density
+        double vv = v*v;
+        double view_h = sqrt(vv) - 1;
+        double view_rho = exp(-view_h / params.scale_height);
+
+        density.add(view_rho, view_step);
+
+        double sv = d.sun * v;
+
+        if (sv < 0 && vv - sv*sv < 1) {
+            intensity.add(0, view_step);
+            continue;
+        }
+
+        integrator in;
+
+        Vec3 w = v;
+        double in_r;
+
+        do {
+            w = w + d.sun_step;
+
+            double ww = w*w;
+            in_r = sqrt(ww);
+            double in_h = in_r - 1;
+            double in_rho = exp(-in_h / params.scale_height);
+
+            density.add(in_rho, p.sun_step);
+        } while (in_r < p.atmos_bound);
+
+        intensity.add(view_rho * exp(-in.acc - density.acc), view_step);
+    } while (z != zf);
+
+    double scaled = intensity.acc * 3000;
+
+    if (scaled > 255) {
+        r = 255;
+        g = b = 0;
+    } else {
+        r = g = b = scaled;
+    }
 }
 
 ImVec4 clear_color = ImVec4(0, 0, 0, 1);
@@ -139,6 +268,8 @@ SDL_AppResult SDL_AppIterate(void *appstate) {
     if (dirty) {
         double pixel_zoom = std::min(w, h) / exp(params.zoom);
 
+        Derived d(params);
+
         for (int i = 0; i < w; i++) {
             for (int j = 0; j < h; j++) {
                 double x = params.cx + pixel_zoom * (i - w / 2);
@@ -150,7 +281,7 @@ SDL_AppResult SDL_AppIterate(void *appstate) {
                 uint8_t& g = pixels[off++];
                 uint8_t& b = pixels[off];
 
-                compute(params, x, y, r, g, b);
+                compute(params, d, x, y, r, g, b);
             }
         }
 
@@ -194,6 +325,10 @@ SDL_AppResult SDL_AppIterate(void *appstate) {
     
     dirty |= ImGui::SliderDouble("Scale height", &params.scale_height, 0.0, 0.01, "%.6f");
     dirty |= ImGui::SliderDouble("Atmosphere bound", &params.atmos_bound, 1.0, 1.5);
+    dirty |= ImGui::SliderDouble("View step", &params.view_step, 1e-3, 1.0);
+    dirty |= ImGui::SliderDouble("Sun step", &params.sun_step, 1e-3, 1.0);
+    dirty |= ImGui::SliderDouble("Sun azimuth", &params.sun_azimuth, 0, 360.0);
+    dirty |= ImGui::SliderDouble("Sun altitude", &params.sun_altitude, -90.0, 90.0);
     dirty |= ImGui::SliderDouble("Camera X", &params.cx, -2.0, 2.0);
     dirty |= ImGui::SliderDouble("Camera Y", &params.cy, -2.0, 2.0);
     dirty |= ImGui::SliderDouble("Zoom", &params.zoom, 0.0, 20.0);
