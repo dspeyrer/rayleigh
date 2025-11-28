@@ -56,31 +56,18 @@ struct Vec3 {
 
 struct Params {
     // The atmosphere scale height.
-    double scale_height;
+    double scale_height = 7994. / 6.3781e6;
     // The exterior bound of the atmosphere.
-    double atmos_bound;
+    double atmos_bound = 1.01;
     // The step size of the rays.
-    double view_step, sun_step, step_scale;
+    double view_step = 0.001, sun_step = 0.001, step_scale = 0;
     // The sun angle
-    double sun_azimuth, sun_altitude;
+    double sun_azimuth = 270, sun_altitude = 0;
     // The camera options.
-    double cx, cy, zoom;
+    double cx = 1, cy = 0, zoom = 13;
 
-    Params() {
-        scale_height = 7994. / 6.3781e6;
-        atmos_bound = 1.01;
 
-        view_step = 0.001;
-        sun_step = 0.001;
-        step_scale = 0;
-
-        sun_azimuth = 270;
-        sun_altitude = 0;
-
-        cx = 1.0;
-        cy = 0.0;
-        zoom = 13.0;
-    }
+    double depth_gain = 50.0, out_gain = 10000.0;
 };
 
 struct Derived {
@@ -172,7 +159,7 @@ static double compute(Params& p, Derived& d, double gain, double x, double y) {
                 w = w + d.sun * sun_step;
             }
 
-            intensity.add(view_rho * exp(gain * -(in.acc + density.acc)), view_step);
+            intensity.add(view_rho * exp(p.depth_gain * gain * -(in.acc + density.acc)), view_step);
         }
 
         if (z == zf) break;
@@ -191,11 +178,7 @@ static double compute(Params& p, Derived& d, double gain, double x, double y) {
     return gain * intensity.acc;
 }
 
-void worker() {
-    double rs = 10e-26 * pow(760e-9, -4.);
-    double gs = 10e-26 * pow(555e-9, -4.);
-    double bs = 10e-26 * pow(495e-9, -4.);
-    
+void worker() {    
     while (true) {
         std::unique_lock lk(m);
         cv.wait(lk, []{ return dirty; });
@@ -209,6 +192,10 @@ void worker() {
 
         Derived d(p);
 
+        double rs = 1e11 * pow(760., -4.);
+        double gs = 1e11 * pow(555., -4.);
+        double bs = 1e11 * pow(495., -4.);
+
         double pixel_zoom = std::min(w, h) / exp(p.zoom);
 
         size_t off = 0;
@@ -220,9 +207,9 @@ void worker() {
             double y = p.cy + pixel_zoom * (i - h / 2);
             double x = p.cx + pixel_zoom * (j - w / 2);
 
-            buffer[i][j][0] = std::min(compute(p, d, rs, x, y) * 5000, 255.);
-            buffer[i][j][1] = std::min(compute(p, d, gs, x, y) * 5000, 255.);
-            buffer[i][j][2] = std::min(compute(p, d, bs, x, y) * 5000, 255.);
+            buffer[i][j][0] = std::min(p.out_gain * 1.5 * compute(p, d, rs, x, y), 255.);
+            buffer[i][j][1] = std::min(p.out_gain * 1.7 * compute(p, d, gs, x, y), 255.);
+            buffer[i][j][2] = std::min(p.out_gain * 2.0 * compute(p, d, bs, x, y), 255.);
 
             size_t prev = head.exchange(++off, std::memory_order_release);
             
@@ -366,12 +353,14 @@ SDL_AppResult SDL_AppIterate(void *appstate) {
     dirty |= ImGui::SliderDouble("Atmosphere bound", &params.atmos_bound, 1.0, 1.5);
     dirty |= ImGui::SliderDouble("View step", &params.view_step, 1e-4, 1.0);
     dirty |= ImGui::SliderDouble("Sun step", &params.sun_step, 1e-4, 1.0);
-    dirty |= ImGui::SliderDouble("Step scale", &params.step_scale, 0.0, 5.0);
+    dirty |= ImGui::SliderDouble("Step scale", &params.step_scale, 0.0, 2000.0);
     dirty |= ImGui::SliderDouble("Sun azimuth", &params.sun_azimuth, 0, 360.0);
     dirty |= ImGui::SliderDouble("Sun altitude", &params.sun_altitude, -90.0, 90.0);
     dirty |= ImGui::SliderDouble("Camera X", &params.cx, -2.0, 2.0);
     dirty |= ImGui::SliderDouble("Camera Y", &params.cy, -2.0, 2.0);
     dirty |= ImGui::SliderDouble("Zoom", &params.zoom, 0.0, 20.0);
+    dirty |= ImGui::SliderDouble("Depth gain", &params.depth_gain, 0.0, 1000.0);
+    dirty |= ImGui::SliderDouble("Output gain", &params.out_gain, 0.0, 50000.0);
 
     if (dirty) {
         cv.notify_one();
