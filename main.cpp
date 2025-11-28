@@ -67,15 +67,15 @@ struct Params {
         scale_height = 7994. / 6.3781e6;
         atmos_bound = 1.01;
 
-        view_step = 0.01;
-        sun_step = 0.1;
+        view_step = 0.001;
+        sun_step = 0.001;
 
         sun_azimuth = 270;
         sun_altitude = 45;
 
         cx = 0.0;
         cy = 0.0;
-        zoom = 12.0;
+        zoom = 12.3;
     }
 };
 
@@ -116,13 +116,10 @@ struct integrator {
 static bool dirty = true;
 static Params params;
 
-static void compute(Params& p, Derived& d, double x, double y, uint8_t& r, uint8_t& g, uint8_t& b) {
+static double compute(Params& p, Derived& d, double gain, double x, double y) {
     double bound_h_sq = d.b_sq - x * x - y * y;
     
-    if (bound_h_sq < 0) {
-        r = g = b = 0;
-        return;
-    }
+    if (bound_h_sq < 0) return 0.;
     
     double planet_h_sq = 1 - x * x - y * y;
     
@@ -134,21 +131,11 @@ static void compute(Params& p, Derived& d, double x, double y, uint8_t& r, uint8
     integrator density;
     integrator intensity;
 
-    do {
-        // Step along the view ray
-        double view_step = p.view_step;
-        double zn = z - view_step;
+    double view_step = 0;
 
-        if (zn <= zf) {
-            zn = zf;
-            view_step = z - zn;
-        }
-
-        z = zn;
-
+    while (true) {
         Vec3 v(x, y, z);
 
-        // Evaluate density
         double vv = v*v;
         double view_h = sqrt(vv) - 1;
         double view_rho = exp(-view_h / params.scale_height);
@@ -159,36 +146,41 @@ static void compute(Params& p, Derived& d, double x, double y, uint8_t& r, uint8
 
         if (sv < 0 && vv - sv*sv < 1) {
             intensity.add(0, view_step);
-            continue;
+        } else {
+            integrator in;
+
+            Vec3 w = v;
+
+            while (true) {
+                double ww = w*w;
+                double in_r = sqrt(ww);
+                double in_h = in_r - 1;
+                double in_rho = exp(-in_h / params.scale_height);
+                
+                in.add(in_rho, p.sun_step);
+
+                if (in_r >= p.atmos_bound) break;
+
+                w = w + d.sun_step;
+            }
+
+            intensity.add(view_rho * exp(gain * -(in.acc + density.acc)), view_step);
         }
 
-        integrator in;
+        if (z == zf) break;
 
-        Vec3 w = v;
-        double in_r;
+        view_step = p.view_step;
+        double zn = z - view_step;
 
-        do {
-            w = w + d.sun_step;
+        if (zn <= zf) {
+            zn = zf;
+            view_step = z - zn;
+        }
 
-            double ww = w*w;
-            in_r = sqrt(ww);
-            double in_h = in_r - 1;
-            double in_rho = exp(-in_h / params.scale_height);
-
-            density.add(in_rho, p.sun_step);
-        } while (in_r < p.atmos_bound);
-
-        intensity.add(view_rho * exp(-in.acc - density.acc), view_step);
-    } while (z != zf);
-
-    double scaled = intensity.acc * 3000;
-
-    if (scaled > 255) {
-        r = 255;
-        g = b = 0;
-    } else {
-        r = g = b = scaled;
+        z = zn;
     }
+
+    return gain * intensity.acc;
 }
 
 ImVec4 clear_color = ImVec4(0, 0, 0, 1);
@@ -265,7 +257,12 @@ SDL_AppResult SDL_AppIterate(void *appstate) {
 
     SDL_LockTexture(tex, NULL, (void**)&pixels, &pitch);
 
+    
     if (dirty) {
+        double rs = 10e-26 * pow(760e-9, -4.);
+        double gs = 10e-26 * pow(555e-9, -4.);
+        double bs = 10e-26 * pow(495e-9, -4.);
+
         double pixel_zoom = std::min(w, h) / exp(params.zoom);
 
         Derived d(params);
@@ -277,11 +274,9 @@ SDL_AppResult SDL_AppIterate(void *appstate) {
                 
                 size_t off = (i + j * w) * 3;
 
-                uint8_t& r = pixels[off++];
-                uint8_t& g = pixels[off++];
-                uint8_t& b = pixels[off];
-
-                compute(params, d, x, y, r, g, b);
+                pixels[off++] = std::min(compute(params, d, rs, x, y) * 5000, 255.);
+                pixels[off++] = std::min(compute(params, d, gs, x, y) * 5000, 255.);
+                pixels[off++] = std::min(compute(params, d, bs, x, y) * 5000, 255.);
             }
         }
 
