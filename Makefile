@@ -9,7 +9,7 @@ LINUX_GL_LIBS = -lGL
 
 CXXFLAGS = -std=c++17 -I$(IMGUI_DIR) -I$(IMGUI_DIR)/backends
 CXXFLAGS += -O3 -g -Wall -Wformat
-LIBS =
+LIBS = -lSDL3_image
 
 ##---------------------------------------------------------------------
 ## BUILD FLAGS PER PLATFORM
