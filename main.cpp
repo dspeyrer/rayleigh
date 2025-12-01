@@ -21,7 +21,7 @@ static SDL_Window* window;
 static SDL_Renderer* renderer;
 static SDL_Texture* tex;
 
-static SDL_Surface* world;
+static SDL_Surface* diffuse;
 
 namespace ImGui {
     bool SliderDouble(const char* label, double* v, double v_min, double v_max, const char* format = "%.3f", ImGuiSliderFlags flags = 0) {
@@ -29,8 +29,8 @@ namespace ImGui {
     }
 }
 
-constexpr int w = 1920;
-constexpr int h = 1080;
+constexpr int w = 500;
+constexpr int h = 500;
 
 struct Vec3 {
     double x, y, z;
@@ -138,13 +138,15 @@ struct Params {
     double view_step = 0.001, sun_step = 0.001, step_scale = 0;
     // The angle to the sun.
     double sun_azimuth = 270, sun_altitude = 0;
+
     // The orientation of the planet.
-    double planet_yaw = 0.0, planet_pitch = 0.0, planet_roll = 0.0;
+    double planet_yaw = 0, planet_pitch = 0, planet_roll = 0;
+
     // The camera options.
-    double cx = 0, cy = 0, zoom = 12;
+    double cx = 0, cy = 0, zoom = 11;
 
 
-    double depth_gain = 50.0, out_gain = 10000.0;
+    double depth_gain = 50, out_gain = 10000;
 };
 
 struct Derived {
@@ -191,35 +193,25 @@ static Params params;
 static std::atomic<size_t> head;
 static uint8_t buffer[h][w][3];
 
-static void sample_texture(Params& p, Derived& d, double x, double y, uint8_t (&color)[3]) {
-    double planet_h_sq = 1 - x * x - y * y;
-
-    if (planet_h_sq < 0) {
-        color[0] = 0x00;
-        color[1] = 0x00;
-        color[2] = 0x00;
-        return;
-    }
-
-    double z = sqrt(planet_h_sq);
-
-    Vec3 v(x, y, z);
-
+static uint8_t sample_texture(Params& p, Derived& d, SDL_Surface* tex, int c, Vec3 v) {
     v = d.planet_transform * v;
 
-    int sx = (atan2(v.x, v.z) / M_PI / 2 + 0.5) * world->w;
-    int sy = (asin(v.y) / M_PI + 0.5) * world->h;
+    int sx = (atan2(v.x, v.z) / M_PI / 2 + 0.5) * tex->w;
+    int sy = (asin(v.y) / M_PI + 0.5) * tex->h;
 
-    SDL_ReadSurfacePixel(world, sx, sy, &color[0], &color[1], &color[2], NULL);
+    uint8_t channel[3];
+    SDL_ReadSurfacePixel(tex, sx, sy, &channel[0], &channel[1], &channel[2], NULL);
+
+    return channel[c];
 }
 
 static double compute(Params& p, Derived& d, double gain, double x, double y) {
     double bound_h_sq = d.b_sq - x * x - y * y;
-    
+
     if (bound_h_sq < 0) return 0.;
-    
+
     double planet_h_sq = 1 - x * x - y * y;
-    
+
     bool hit = planet_h_sq >= 0;
 
     double z = sqrt(bound_h_sq);
@@ -241,9 +233,9 @@ static double compute(Params& p, Derived& d, double gain, double x, double y) {
 
         double sv = d.sun * v;
 
-        if (sv < 0 && vv - sv*sv < 1) {
-            intensity.add(0, view_step);
-        } else {
+        double view_intensity = 0;
+
+        if (sv >= 0 || vv - sv*sv >= 1) {
             integrator in;
             Vec3 w = v;
             double sun_step = 0;
@@ -262,8 +254,10 @@ static double compute(Params& p, Derived& d, double gain, double x, double y) {
                 w = w + d.sun * sun_step;
             }
 
-            intensity.add(view_rho * exp(p.depth_gain * gain * -(in.acc + density.acc)), view_step);
+            view_intensity = view_rho * exp(p.depth_gain * gain * -(in.acc + density.acc));
         }
+
+        intensity.add(view_intensity, view_step);
 
         if (z == zf) break;
 
@@ -289,7 +283,7 @@ void worker() {
         Params p = params;
 
         dirty = false;
-        head.store(0, std::memory_order_relaxed);
+        head.store(0);
 
         lk.unlock();
 
@@ -310,11 +304,9 @@ void worker() {
             double y = p.cy + pixel_zoom * (i - h / 2);
             double x = p.cx + pixel_zoom * (j - w / 2);
 
-            sample_texture(p, d, x, y, buffer[i][j]);
-
-            // buffer[i][j][0] = std::min(p.out_gain * 1.5 * compute(p, d, rs, x, y), 255.);
-            // buffer[i][j][1] = std::min(p.out_gain * 1.7 * compute(p, d, gs, x, y), 255.);
-            // buffer[i][j][2] = std::min(p.out_gain * 2.0 * compute(p, d, bs, x, y), 255.);
+            buffer[i][j][0] = std::min(p.out_gain * 1.5 * compute(p, d, rs, x, y), 255.);
+            buffer[i][j][1] = std::min(p.out_gain * 1.7 * compute(p, d, gs, x, y), 255.);
+            buffer[i][j][2] = std::min(p.out_gain * 2.0 * compute(p, d, bs, x, y), 255.);
 
             size_t prev = head.exchange(++off, std::memory_order_release);
             
@@ -366,13 +358,13 @@ SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
     ImGui_ImplSDL3_InitForSDLRenderer(window, renderer);
     ImGui_ImplSDLRenderer3_Init(renderer);
 
-    io.Fonts->AddFontFromFileTTF("./assets/fonts/Cousine-Regular.ttf");
+    io.Fonts->AddFontDefault();
 
     tex = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_RGB24, SDL_TEXTUREACCESS_STREAMING, w, h);
 
-    world = IMG_Load("./assets/images/NASA_BlueMarble_2004_11.png");
+    diffuse = IMG_Load("./assets/images/NASA_BlueMarble_2004_11.png");
 
-    if (!world) {
+    if (!diffuse) {
         SDL_Log("Error: IMG_Load(): %s\n", SDL_GetError());
         return SDL_APP_FAILURE;
     }
@@ -412,7 +404,7 @@ SDL_AppResult SDL_AppIterate(void *appstate) {
         int pitch = -1;
 
         SDL_LockTexture(tex, NULL, (void**)&pixels, &pitch);
-        
+
         for (int off = prev_head; off < cur_head; off++) {
             int i = off / w;
             int j = off % w;
@@ -428,11 +420,11 @@ SDL_AppResult SDL_AppIterate(void *appstate) {
 
     SDL_Rect view;
     SDL_GetRenderViewport(renderer, &view);
-    
+
     double scale = std::min((double) view.h / h, (double) view.w / w);
 
     SDL_FRect texdst;
-    
+
     texdst.w = w * scale;
     texdst.h = h * scale;
 
@@ -456,34 +448,44 @@ SDL_AppResult SDL_AppIterate(void *appstate) {
     ImGui::ColorEdit3("Background", (float*) &clear_color);
 
     ImGui::End();
-    
+
     ImGui::Begin("Parameters");
-    
+
     std::unique_lock lk(m);
 
+    ImGui::SeparatorText("Atmosphere");
+
     dirty |= ImGui::SliderDouble("Scale height", &params.scale_height, 0.0, 0.01, "%.6f");
-    dirty |= ImGui::SliderDouble("Atmosphere bound", &params.atmos_bound, 1.0, 1.5);
+    dirty |= ImGui::SliderDouble("Bound", &params.atmos_bound, 1.0, 1.5);
     dirty |= ImGui::SliderDouble("View step", &params.view_step, 1e-4, 1.0);
     dirty |= ImGui::SliderDouble("Sun step", &params.sun_step, 1e-4, 1.0);
     dirty |= ImGui::SliderDouble("Step scale", &params.step_scale, 0.0, 2000.0);
     dirty |= ImGui::SliderDouble("Sun azimuth", &params.sun_azimuth, 0, 360.0);
     dirty |= ImGui::SliderDouble("Sun altitude", &params.sun_altitude, -90.0, 90.0);
+    dirty |= ImGui::SliderDouble("Depth gain", &params.depth_gain, 0.0, 1000.0);
+    dirty |= ImGui::SliderDouble("Output gain", &params.out_gain, 0.0, 50000.0);
+    
+    ImGui::SeparatorText("Surface");
+    
     dirty |= ImGui::SliderDouble("Planet yaw", &params.planet_yaw, -M_PI, M_PI);
     dirty |= ImGui::SliderDouble("Planet pitch", &params.planet_pitch, -M_PI, M_PI);
     dirty |= ImGui::SliderDouble("Planet roll", &params.planet_roll, -M_PI, M_PI);
+
+    ImGui::SeparatorText("Camera");
+    
     dirty |= ImGui::SliderDouble("Camera X", &params.cx, -2.0, 2.0);
     dirty |= ImGui::SliderDouble("Camera Y", &params.cy, -2.0, 2.0);
     dirty |= ImGui::SliderDouble("Zoom", &params.zoom, 0.0, 20.0);
-    dirty |= ImGui::SliderDouble("Depth gain", &params.depth_gain, 0.0, 1000.0);
-    dirty |= ImGui::SliderDouble("Output gain", &params.out_gain, 0.0, 50000.0);
 
     if (dirty) {
         cv.notify_one();
-        head.store(SIZE_MAX, std::memory_order_relaxed);
+        head.store(SIZE_MAX);
         prev_head = 0;
     }
-
+    
     lk.unlock();
+
+    ImGui::SeparatorText("Camera");
 
     ImGui::ProgressBar((float) cur_head / (w * h));
 
