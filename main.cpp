@@ -29,8 +29,8 @@ namespace ImGui {
     }
 }
 
-constexpr int w = 500;
-constexpr int h = 500;
+constexpr int w = 1000;
+constexpr int h = 1000;
 
 struct Vec3 {
     double x, y, z;
@@ -135,18 +135,20 @@ struct Params {
     // The exterior bound of the atmosphere.
     double atmos_bound = 1.01;
     // The step size of the rays.
-    double view_step = 0.001, sun_step = 0.001, step_scale = 0;
+    double view_step = 1000, sun_step = 1000, step_scale = 0;
     // The angle to the sun.
     double sun_azimuth = 270, sun_altitude = 0;
+
+    // The atmospheric parameter.
+    double k = 128139406146;
+
+    double exposure = 10000;
 
     // The orientation of the planet.
     double planet_yaw = 0, planet_pitch = 0, planet_roll = 0;
 
     // The camera options.
     double cx = 0, cy = 0, zoom = 11;
-
-
-    double depth_gain = 50, out_gain = 10000;
 };
 
 struct Derived {
@@ -193,19 +195,57 @@ static Params params;
 static std::atomic<size_t> head;
 static uint8_t buffer[h][w][3];
 
-static uint8_t sample_texture(Params& p, Derived& d, SDL_Surface* tex, int c, Vec3 v) {
-    v = d.planet_transform * v;
+static double sample_nearest(SDL_Surface* surf, int x, int y, int c, bool wrap) {
+    if (wrap) {
+        x %= surf->w;
+        y %= surf->h;
+    }
 
-    int sx = (atan2(v.x, v.z) / M_PI / 2 + 0.5) * tex->w;
-    int sy = (asin(v.y) / M_PI + 0.5) * tex->h;
+    if (x < 0 || x >= surf->w || y < 0 || y >= surf->h) {
+        printf("out-of-bounds texture sample (%d, %d) for texture of size (%d, %d)\n", x, y, surf->w, surf->h);
+        return -1;
+    }
 
-    uint8_t channel[3];
-    SDL_ReadSurfacePixel(tex, sx, sy, &channel[0], &channel[1], &channel[2], NULL);
+    if (surf->format == SDL_PIXELFORMAT_RGB24)
+        return *((uint8_t*)surf->pixels + y * surf->pitch + x * 3 + c) / 255.;
+    
+    if (surf->format == SDL_PIXELFORMAT_INDEX8)
+        return *((uint8_t*)surf->pixels + y * surf->pitch + x) / 255.;
 
-    return channel[c];
+    printf("unsupported pixel format %x\n", surf->format);
+    return -1;
 }
 
-static double compute(Params& p, Derived& d, double gain, double x, double y) {
+static double sample_bilinear(SDL_Surface* surf, double x, double y, int c, bool wrap) {
+    int l = (int) x;
+    int u = (int) y;
+
+    int r = l + 1;
+    int d = u + 1;
+
+    double tx = fmod(x, 1);
+    double ty = fmod(y, 1);
+
+    double lu = sample_nearest(surf, l, u, c, wrap);
+    double ru = sample_nearest(surf, r, u, c, wrap);
+    double ld = sample_nearest(surf, l, d, c, wrap);
+    double rd = sample_nearest(surf, r, d, c, wrap);
+
+    double vu = lu + tx * (ru - lu);
+    double vd = ld + tx * (rd - ld);
+    return vd = vu + ty * (vd - vu);
+}
+
+static double sample_texture(Params& p, Derived& d, SDL_Surface* surf, int c, Vec3 v) {
+    v = d.planet_transform * v;
+
+    double sx = (atan2(v.x, v.z) / M_PI / 2 + 0.5) * surf->w;
+    double sy = (asin(v.y) / M_PI + 0.5) * surf->h;
+
+    return sample_bilinear(surf, sx, sy, c, true);
+}
+
+static double compute(Params& p, Derived& d, double k, double solar, double x, double y, int c) {
     double bound_h_sq = d.b_sq - x * x - y * y;
 
     if (bound_h_sq < 0) return 0.;
@@ -250,18 +290,18 @@ static double compute(Params& p, Derived& d, double gain, double x, double y) {
 
                 if (in_r >= p.atmos_bound) break;
 
-                sun_step = p.sun_step * exp(p.step_scale * in_h);
+                sun_step = exp(p.step_scale * in_h) / p.sun_step;
                 w = w + d.sun * sun_step;
             }
 
-            view_intensity = view_rho * exp(p.depth_gain * gain * -(in.acc + density.acc));
+            view_intensity = view_rho * exp(4 * M_PI * k * -(in.acc + density.acc));
         }
 
-        intensity.add(view_intensity, view_step);
+        intensity.add(view_intensity, view_step);   
 
         if (z == zf) break;
 
-        view_step = p.view_step * exp(p.step_scale * view_h);
+        view_step = exp(p.step_scale * view_h) / p.view_step;
         double zn = z - view_step;
 
         if (zn <= zf) {
@@ -272,7 +312,7 @@ static double compute(Params& p, Derived& d, double gain, double x, double y) {
         z = zn;
     }
 
-    return gain * intensity.acc;
+    return solar * k * intensity.acc;
 }
 
 void worker() {    
@@ -289,9 +329,9 @@ void worker() {
 
         Derived d(p);
 
-        double rs = 1e11 * pow(760., -4.);
-        double gs = 1e11 * pow(555., -4.);
-        double bs = 1e11 * pow(495., -4.);
+        double kr = p.k * pow(760, -4);
+        double kg = p.k * pow(555, -4);
+        double kb = p.k * pow(495, -4);
 
         double pixel_zoom = std::min(w, h) / exp(p.zoom);
 
@@ -304,9 +344,9 @@ void worker() {
             double y = p.cy + pixel_zoom * (i - h / 2);
             double x = p.cx + pixel_zoom * (j - w / 2);
 
-            buffer[i][j][0] = std::min(p.out_gain * 1.5 * compute(p, d, rs, x, y), 255.);
-            buffer[i][j][1] = std::min(p.out_gain * 1.7 * compute(p, d, gs, x, y), 255.);
-            buffer[i][j][2] = std::min(p.out_gain * 2.0 * compute(p, d, bs, x, y), 255.);
+            buffer[i][j][0] = std::min(p.exposure * compute(p, d, kr, 1.5, x, y, 0), 255.);
+            buffer[i][j][1] = std::min(p.exposure * compute(p, d, kg, 1.7, x, y, 1), 255.);
+            buffer[i][j][2] = std::min(p.exposure * compute(p, d, kb, 2.0, x, y, 2), 255.);
 
             size_t prev = head.exchange(++off, std::memory_order_release);
             
@@ -399,7 +439,7 @@ SDL_AppResult SDL_AppIterate(void *appstate) {
 
     size_t cur_head = head.load(std::memory_order_acquire);
 
-    if (cur_head > prev_head) {
+    if (cur_head > prev_head && cur_head != SIZE_MAX) {
         uint8_t* pixels = nullptr;
         int pitch = -1;
 
@@ -457,13 +497,13 @@ SDL_AppResult SDL_AppIterate(void *appstate) {
 
     dirty |= ImGui::SliderDouble("Scale height", &params.scale_height, 0.0, 0.01, "%.6f");
     dirty |= ImGui::SliderDouble("Bound", &params.atmos_bound, 1.0, 1.5);
-    dirty |= ImGui::SliderDouble("View step", &params.view_step, 1e-4, 1.0);
-    dirty |= ImGui::SliderDouble("Sun step", &params.sun_step, 1e-4, 1.0);
+    dirty |= ImGui::SliderDouble("View step", &params.view_step, 10, 1e6);
+    dirty |= ImGui::SliderDouble("Sun step", &params.sun_step, 10, 1e6);
     dirty |= ImGui::SliderDouble("Step scale", &params.step_scale, 0.0, 2000.0);
     dirty |= ImGui::SliderDouble("Sun azimuth", &params.sun_azimuth, 0, 360.0);
     dirty |= ImGui::SliderDouble("Sun altitude", &params.sun_altitude, -90.0, 90.0);
-    dirty |= ImGui::SliderDouble("Depth gain", &params.depth_gain, 0.0, 1000.0);
-    dirty |= ImGui::SliderDouble("Output gain", &params.out_gain, 0.0, 50000.0);
+    dirty |= ImGui::SliderDouble("K", &params.k, 0.0, 1000.0);
+    dirty |= ImGui::SliderDouble("Exposure", &params.exposure, 0.0, 100.0);
     
     ImGui::SeparatorText("Surface");
     
