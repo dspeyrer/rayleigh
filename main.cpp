@@ -11,6 +11,7 @@
 #include <mutex>
 #include <condition_variable>
 #include <thread>
+#include <limits>
 
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_main.h>
@@ -245,6 +246,29 @@ static double sample_texture(Params& p, Derived& d, SDL_Surface* surf, int c, Ve
     return sample_bilinear(surf, sx, sy, c, true);
 }
 
+static double optical_depth_to_sun(Params& p, Derived& d, double z, double r) {
+    if (z < 0 && r < 1)
+        return std::numeric_limits<double>::infinity();
+
+    integrator depth;
+    double step_size = 0;
+
+    while (true) {
+        double planet_distance = hypot(r, z);
+        double h = planet_distance - 1;
+        double rho = exp(-h / params.scale_height);
+        
+        depth.add(rho, step_size);
+
+        if (planet_distance >= p.atmos_bound) break;
+
+        step_size = exp(p.step_scale * h) / p.sun_step;
+        z += step_size;
+    }
+
+    return depth.acc;
+}
+
 static double compute(Params& p, Derived& d, double k, double solar, double x, double y, int c) {
     double bound_h_sq = d.b_sq - x * x - y * y;
 
@@ -257,56 +281,36 @@ static double compute(Params& p, Derived& d, double k, double solar, double x, d
     double z = sqrt(bound_h_sq);
     double zf = hit ? sqrt(planet_h_sq) : -z;
 
-    integrator density;
+    integrator depth;
     integrator intensity;
 
-    double view_step = 0;
+    double step_size = 0;
 
     while (true) {
         Vec3 v(x, y, z);
 
-        double vv = v*v;
-        double view_h = sqrt(vv) - 1;
-        double view_rho = exp(-view_h / params.scale_height);
+        double v_v = v*v;
+        double h = sqrt(v_v) - 1;
+        double rho = exp(-h / params.scale_height);
 
-        density.add(view_rho, view_step);
+        depth.add(rho, step_size);
 
-        double sv = d.sun * v;
+        double proj = v * d.sun;
+        double orth = sqrt(v_v - proj*proj);
 
-        double view_intensity = 0;
+        double depth_to_sun = optical_depth_to_sun(p, d, proj, orth);
+        double scatter_in = rho * exp(4 * M_PI * k * -(depth_to_sun + depth.acc));
 
-        if (sv >= 0 || vv - sv*sv >= 1) {
-            integrator in;
-            Vec3 w = v;
-            double sun_step = 0;
-
-            while (true) {
-                double ww = w*w;
-                double in_r = sqrt(ww);
-                double in_h = in_r - 1;
-                double in_rho = exp(-in_h / params.scale_height);
-                
-                in.add(in_rho, sun_step);
-
-                if (in_r >= p.atmos_bound) break;
-
-                sun_step = exp(p.step_scale * in_h) / p.sun_step;
-                w = w + d.sun * sun_step;
-            }
-
-            view_intensity = view_rho * exp(4 * M_PI * k * -(in.acc + density.acc));
-        }
-
-        intensity.add(view_intensity, view_step);   
+        intensity.add(scatter_in, step_size);   
 
         if (z == zf) break;
 
-        view_step = exp(p.step_scale * view_h) / p.view_step;
-        double zn = z - view_step;
+        step_size = exp(p.step_scale * h) / p.view_step;
+        double zn = z - step_size;
 
         if (zn <= zf) {
             zn = zf;
-            view_step = z - zn;
+            step_size = z - zn;
         }
 
         z = zn;
