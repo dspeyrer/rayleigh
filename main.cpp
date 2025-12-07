@@ -12,6 +12,7 @@
 #include <condition_variable>
 #include <thread>
 #include <limits>
+#include <cmath>
 
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_main.h>
@@ -24,14 +25,31 @@ static SDL_Texture* tex;
 
 static SDL_Surface* diffuse;
 
-namespace ImGui {
     bool SliderDouble(const char* label, double* v, double v_min, double v_max, const char* format = "%.3f", ImGuiSliderFlags flags = 0) {
-        return SliderScalar(label, ImGuiDataType_Double, v, &v_min, &v_max, format, flags);
+    return ImGui::SliderScalar(label, ImGuiDataType_Double, v, &v_min, &v_max, format, flags);
     }
+
+bool SliderExp(const char* label, double* v, double v_min, double v_max) {
+    int e = std::floor(std::log10(*v));
+    double m = *v / pow(10, e);
+    
+    bool changed = false;
+    
+    ImGui::PushID(label);
+    ImGui::PushItemWidth(76);
+    changed |= SliderDouble("##", &m, 1.0, 10.0);
+    ImGui::SameLine();
+    changed |= ImGui::SliderInt(label, &e, v_min, v_max);
+    ImGui::PopItemWidth();
+    ImGui::PopID();
+
+    if (changed) *v = m * pow(10, e);
+
+    return changed;
 }
 
-constexpr int w = 1000;
-constexpr int h = 1000;
+constexpr int w = 500;
+constexpr int h = 500;
 
 struct Vec3 {
     double x, y, z;
@@ -149,7 +167,7 @@ struct Params {
     double planet_yaw = 0, planet_pitch = 0, planet_roll = 0;
 
     // The camera options.
-    double cx = 0, cy = 0, zoom = 11;
+    double cx = 0, cy = 0, zoom = -2;
 };
 
 struct Derived {
@@ -269,7 +287,7 @@ static double optical_depth_to_sun(Params& p, Derived& d, double z, double r) {
     return depth.acc;
 }
 
-static double compute(Params& p, Derived& d, double k, double solar, double x, double y, int c) {
+static double compute(Params& p, Derived& d, double k, double x, double y, int c) {
     double bound_h_sq = d.b_sq - x * x - y * y;
 
     if (bound_h_sq < 0) return 0.;
@@ -316,7 +334,7 @@ static double compute(Params& p, Derived& d, double k, double solar, double x, d
         z = zn;
     }
 
-    return solar * k * intensity.acc;
+    return k * intensity.acc;
 }
 
 void worker() {    
@@ -337,7 +355,7 @@ void worker() {
         double kg = p.k * pow(555, -4);
         double kb = p.k * pow(495, -4);
 
-        double pixel_zoom = std::min(w, h) / exp(p.zoom);
+        double pixel_zoom = exp(-p.zoom) / std::min(w, h);
 
         size_t off = 0;
 
@@ -348,9 +366,9 @@ void worker() {
             double y = p.cy + pixel_zoom * (i - h / 2);
             double x = p.cx + pixel_zoom * (j - w / 2);
 
-            buffer[i][j][0] = std::min(p.exposure * compute(p, d, kr, 1.5, x, y, 0), 255.);
-            buffer[i][j][1] = std::min(p.exposure * compute(p, d, kg, 1.7, x, y, 1), 255.);
-            buffer[i][j][2] = std::min(p.exposure * compute(p, d, kb, 2.0, x, y, 2), 255.);
+            buffer[i][j][0] = std::min(p.exposure * compute(p, d, kr * 1.5, x, y, 0), 255.);
+            buffer[i][j][1] = std::min(p.exposure * compute(p, d, kg * 1.7, x, y, 1), 255.);
+            buffer[i][j][2] = std::min(p.exposure * compute(p, d, kb * 2.0, x, y, 2), 255.);
 
             size_t prev = head.exchange(++off, std::memory_order_release);
             
@@ -494,32 +512,34 @@ SDL_AppResult SDL_AppIterate(void *appstate) {
     ImGui::End();
 
     ImGui::Begin("Parameters");
+    ImGui::PushItemWidth(160);
 
     std::unique_lock lk(m);
 
     ImGui::SeparatorText("Atmosphere");
 
-    dirty |= ImGui::SliderDouble("Scale height", &params.scale_height, 0.0, 0.01, "%.6f");
-    dirty |= ImGui::SliderDouble("Bound", &params.atmos_bound, 1.0, 1.5);
-    dirty |= ImGui::SliderDouble("View step", &params.view_step, 10, 1e6);
-    dirty |= ImGui::SliderDouble("Sun step", &params.sun_step, 10, 1e6);
-    dirty |= ImGui::SliderDouble("Step scale", &params.step_scale, 0.0, 2000.0);
-    dirty |= ImGui::SliderDouble("Sun azimuth", &params.sun_azimuth, 0, 360.0);
-    dirty |= ImGui::SliderDouble("Sun altitude", &params.sun_altitude, -90.0, 90.0);
-    dirty |= ImGui::SliderDouble("K", &params.k, 0.0, 1000.0);
-    dirty |= ImGui::SliderDouble("Exposure", &params.exposure, 0.0, 100.0);
+
+    dirty |= SliderDouble("Scale height", &params.scale_height, 0.0, 0.01, "%.6f");
+    dirty |= SliderDouble("Bound", &params.atmos_bound, 1.0, 1.5);
+    dirty |= SliderDouble("View step", &params.view_step, 10, 1e6);
+    dirty |= SliderDouble("Sun step", &params.sun_step, 10, 1e6);
+    dirty |= SliderDouble("Step scale", &params.step_scale, 0.0, 2000.0);
+    dirty |= SliderDouble("Sun azimuth", &params.sun_azimuth, 0, 360.0);
+    dirty |= SliderDouble("Sun altitude", &params.sun_altitude, -90.0, 90.0);
+    dirty |= SliderExp("K", &params.k, 0.0, 15.0);
+    dirty |= SliderDouble("Exposure", &params.exposure, 0.0, 100.0);
     
     ImGui::SeparatorText("Surface");
     
-    dirty |= ImGui::SliderDouble("Planet yaw", &params.planet_yaw, -M_PI, M_PI);
-    dirty |= ImGui::SliderDouble("Planet pitch", &params.planet_pitch, -M_PI, M_PI);
-    dirty |= ImGui::SliderDouble("Planet roll", &params.planet_roll, -M_PI, M_PI);
+    dirty |= SliderDouble("Planet yaw", &params.planet_yaw, -M_PI, M_PI);
+    dirty |= SliderDouble("Planet pitch", &params.planet_pitch, -M_PI, M_PI);
+    dirty |= SliderDouble("Planet roll", &params.planet_roll, -M_PI, M_PI);
 
     ImGui::SeparatorText("Camera");
     
-    dirty |= ImGui::SliderDouble("Camera X", &params.cx, -2.0, 2.0);
-    dirty |= ImGui::SliderDouble("Camera Y", &params.cy, -2.0, 2.0);
-    dirty |= ImGui::SliderDouble("Zoom", &params.zoom, 0.0, 20.0);
+    dirty |= SliderDouble("Camera X", &params.cx, -2.0, 2.0);
+    dirty |= SliderDouble("Camera Y", &params.cy, -2.0, 2.0);
+    dirty |= SliderDouble("Zoom", &params.zoom, -5.0, 5.0);
 
     if (dirty) {
         cv.notify_one();
@@ -533,6 +553,7 @@ SDL_AppResult SDL_AppIterate(void *appstate) {
 
     ImGui::ProgressBar((float) cur_head / (w * h));
 
+    ImGui::PopItemWidth();
     ImGui::End();
 
     ImGui::Render();
