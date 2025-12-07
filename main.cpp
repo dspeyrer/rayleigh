@@ -43,7 +43,8 @@ bool SliderExp(const char* label, double* v, double v_min, double v_max) {
     ImGui::PopItemWidth();
     ImGui::PopID();
 
-    if (changed) *v = m * pow(10, e);
+    if (changed && m < 10.)
+        *v = m * pow(10, e);
 
     return changed;
 }
@@ -157,11 +158,14 @@ struct Params {
     double view_step = 1000, sun_step = 1000, step_scale = 0;
     // The angle to the sun.
     double sun_azimuth = 270, sun_altitude = 0;
+    // The solar irradiance of the colors of each channel.
+    float ssi[3] = { 0.75, 0.85, 1.0 };
 
     // The atmospheric parameter.
     double k = 128139406146;
 
-    double exposure = 10000;
+    double exposure = 2.0;
+
 
     // The orientation of the planet.
     double planet_yaw = 0, planet_pitch = 0, planet_roll = 0;
@@ -321,7 +325,12 @@ static double compute(Params& p, Derived& d, double k, double x, double y, int c
 
         intensity.add(scatter_in, step_size);   
 
-        if (z == zf) break;
+        if (z == zf) {
+            if (hit)
+                intensity.acc += scatter_in * sample_texture(p, d, diffuse, c, v);
+
+            return p.ssi[c] * k * intensity.acc;
+        };
 
         step_size = exp(p.step_scale * h) / p.view_step;
         double zn = z - step_size;
@@ -333,8 +342,6 @@ static double compute(Params& p, Derived& d, double k, double x, double y, int c
 
         z = zn;
     }
-
-    return k * intensity.acc;
 }
 
 void worker() {    
@@ -366,9 +373,9 @@ void worker() {
             double y = p.cy + pixel_zoom * (i - h / 2);
             double x = p.cx + pixel_zoom * (j - w / 2);
 
-            buffer[i][j][0] = std::min(p.exposure * compute(p, d, kr * 1.5, x, y, 0), 255.);
-            buffer[i][j][1] = std::min(p.exposure * compute(p, d, kg * 1.7, x, y, 1), 255.);
-            buffer[i][j][2] = std::min(p.exposure * compute(p, d, kb * 2.0, x, y, 2), 255.);
+            buffer[i][j][0] = 255 * (1. - exp(-p.exposure * compute(p, d, kr, x, y, 0)));
+            buffer[i][j][1] = 255 * (1. - exp(-p.exposure * compute(p, d, kg, x, y, 1)));
+            buffer[i][j][2] = 255 * (1. - exp(-p.exposure * compute(p, d, kb, x, y, 2)));
 
             size_t prev = head.exchange(++off, std::memory_order_release);
             
@@ -377,8 +384,6 @@ void worker() {
         }
     }
 }
-
-ImVec4 clear_color = ImVec4(0, 0, 0, 1);
 
 SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
     if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD)) {
@@ -493,7 +498,7 @@ SDL_AppResult SDL_AppIterate(void *appstate) {
     texdst.x = (view.w - texdst.w) / 2.;
     texdst.y = (view.h - texdst.h) / 2.;
 
-    SDL_SetRenderDrawColorFloat(renderer, clear_color.x, clear_color.y, clear_color.z, clear_color.w);
+    SDL_SetRenderDrawColorFloat(renderer, 0.0, 0.0, 0.0, 1.0);
     SDL_RenderClear(renderer);
 
     SDL_RenderTexture(renderer, tex, NULL, &texdst);
@@ -502,15 +507,6 @@ SDL_AppResult SDL_AppIterate(void *appstate) {
     ImGui_ImplSDL3_NewFrame();
     ImGui::NewFrame();
 
-    ImGui::Begin("Preview");
-
-    ImGui::Text("window=%dx%d", view.w, view.h);
-    ImGui::Text("viewport=(%.2f, %.2f), %.2fx%.2f", texdst.x, texdst.y, texdst.w, texdst.h);
-
-    ImGui::ColorEdit3("Background", (float*) &clear_color);
-
-    ImGui::End();
-
     ImGui::Begin("Parameters");
     ImGui::PushItemWidth(160);
 
@@ -518,16 +514,19 @@ SDL_AppResult SDL_AppIterate(void *appstate) {
 
     ImGui::SeparatorText("Atmosphere");
 
-
     dirty |= SliderDouble("Scale height", &params.scale_height, 0.0, 0.01, "%.6f");
     dirty |= SliderDouble("Bound", &params.atmos_bound, 1.0, 1.5);
     dirty |= SliderDouble("View step", &params.view_step, 10, 1e6);
     dirty |= SliderDouble("Sun step", &params.sun_step, 10, 1e6);
     dirty |= SliderDouble("Step scale", &params.step_scale, 0.0, 2000.0);
-    dirty |= SliderDouble("Sun azimuth", &params.sun_azimuth, 0, 360.0);
-    dirty |= SliderDouble("Sun altitude", &params.sun_altitude, -90.0, 90.0);
     dirty |= SliderExp("K", &params.k, 0.0, 15.0);
-    dirty |= SliderDouble("Exposure", &params.exposure, 0.0, 100.0);
+    dirty |= SliderDouble("Exposure", &params.exposure, 0.0, 10.0);
+
+    ImGui::SeparatorText("Sun");
+
+    dirty |= SliderDouble("Azimuth", &params.sun_azimuth, 0, 360.0);
+    dirty |= SliderDouble("Altitude", &params.sun_altitude, -90.0, 90.0);
+    dirty |= ImGui::ColorEdit3("SSI", params.ssi);
     
     ImGui::SeparatorText("Surface");
     
@@ -549,7 +548,7 @@ SDL_AppResult SDL_AppIterate(void *appstate) {
     
     lk.unlock();
 
-    ImGui::SeparatorText("Camera");
+    ImGui::SeparatorText("Status");
 
     ImGui::ProgressBar((float) cur_head / (w * h));
 
