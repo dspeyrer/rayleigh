@@ -24,6 +24,7 @@ static SDL_Renderer* renderer;
 static SDL_Texture* tex;
 
 static SDL_Surface* diffuse;
+static SDL_Surface* illuminants;
 
     bool SliderDouble(const char* label, double* v, double v_min, double v_max, const char* format = "%.3f", ImGuiSliderFlags flags = 0) {
     return ImGui::SliderScalar(label, ImGuiDataType_Double, v, &v_min, &v_max, format, flags);
@@ -160,6 +161,8 @@ struct Params {
     double sun_azimuth = 270, sun_altitude = 0;
     // The solar irradiance of the colors of each channel.
     float ssi[3] = { 0.75, 0.85, 1.0 };
+    // The color of the surface illuminants.
+    float surf_illum[3] = { 1.0, 1.0, 1.0 };
 
     int sky_quant = 100;
     double sky_eval_step = .05;
@@ -279,6 +282,25 @@ static double sample_texture(Params& p, Derived& d, SDL_Surface* surf, int c, Ve
     double sy = (asin(v.y) / M_PI + 0.5) * surf->h;
 
     return sample_bilinear(surf, sx, sy, c, true);
+}
+
+constexpr double illum_y_min = (-75.0 / 90 + 1) / 2;
+constexpr double illum_y_max = ( 65.0 / 90 + 1) / 2;
+
+static double sample_illuminants(Params& p, Derived& d, int c, Vec3 v) {
+    v = d.planet_transform * v;
+
+    double sx = (atan2(v.x, v.z) / M_PI / 2 + 0.5) * illuminants->w;
+    double sy = (asin(v.y) / M_PI + 0.5);
+
+    if (sy < illum_y_min || sy > illum_y_max) return 0.0;
+
+    sy -= illum_y_min;
+    sy /= (illum_y_max - illum_y_min);
+
+    sy *= illuminants->h;
+
+    return sample_bilinear(illuminants, sx, sy, c, true);
 }
 
 static double optical_depth_to_sun(Params& p, Derived& d, double z, double r) {
@@ -454,6 +476,9 @@ static double compute(Params& p, Derived& d, double k, double x, double y, int c
 
             intensity.acc *= p.ssi[c] * k;
 
+            if (hit)
+                intensity.acc += p.surf_illum[c] * exp(-4 * M_PI * k * depth.acc) * sample_illuminants(p, d, c, v);
+
             return intensity.acc;
         };
 
@@ -554,12 +579,23 @@ SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
 
     tex = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_RGB24, SDL_TEXTUREACCESS_STREAMING, w, h);
 
+    printf("Loading assets...\n");
+
     diffuse = IMG_Load("./assets/images/NASA_BlueMarble_2004_11.png");
 
     if (!diffuse) {
         SDL_Log("Error: IMG_Load(): %s\n", SDL_GetError());
         return SDL_APP_FAILURE;
     }
+
+    illuminants = IMG_Load("./assets/images/EOS_VNL_v2.png");
+
+    if (!illuminants) {
+        SDL_Log("Error: IMG_Load(): %s\n", SDL_GetError());
+        return SDL_APP_FAILURE;
+    }
+
+    printf("Loading complete.\n");
 
     std::thread w(worker);
     w.detach();
@@ -658,6 +694,7 @@ SDL_AppResult SDL_AppIterate(void *appstate) {
     dirty |= SliderDouble("Planet yaw", &params.planet_yaw, -M_PI, M_PI);
     dirty |= SliderDouble("Planet pitch", &params.planet_pitch, -M_PI, M_PI);
     dirty |= SliderDouble("Planet roll", &params.planet_roll, -M_PI, M_PI);
+    dirty |= ImGui::ColorEdit3("Surface illuminants", params.surf_illum);
     
     ImGui::SeparatorText("Sky");
 
