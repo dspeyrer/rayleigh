@@ -161,6 +161,9 @@ struct Params {
     // The solar irradiance of the colors of each channel.
     float ssi[3] = { 0.75, 0.85, 1.0 };
 
+    int sky_quant = 100;
+    double sky_eval_step = .05;
+
     // The atmospheric parameter.
     double k = 128139406146;
 
@@ -174,6 +177,11 @@ struct Params {
     double cx = 0, cy = 0, zoom = -2;
 };
 
+struct sky_table {
+    std::vector<double> values;
+    sky_table(size_t samples);
+};
+
 struct Derived {
     // The normalized sun vector.
     Vec3 sun;
@@ -182,7 +190,12 @@ struct Derived {
     // The transform matrix of the planet texture.
     Mat3 planet_transform;
 
-    Derived(Params& p) {
+    // Lookup tables for sky illuminances.
+    sky_table sky_r;
+    sky_table sky_g;
+    sky_table sky_b;
+
+    Derived(Params& p) : sky_r(p.sky_quant), sky_g(p.sky_quant), sky_b(p.sky_quant) {
         double azi = p.sun_azimuth * M_PI / 180;
         double alt = p.sun_altitude * M_PI / 180;
 
@@ -291,6 +304,107 @@ static double optical_depth_to_sun(Params& p, Derived& d, double z, double r) {
     return depth.acc;
 }
 
+// Accumulates in-scattered light starting at point `v` on the surface along ray `r`, where the sun is in the +Z direction.
+static double eval_from_surface(Params& p, Derived& d, double k, int c, Vec3 v, Vec3 r) {
+    integrator depth;
+    integrator intensity;
+
+    double step_size = 0;
+
+    while (true) {
+        double v_v = v*v;
+        double planet_distance = sqrt(v_v);
+        double h = planet_distance  - 1;
+        double rho = exp(-h / params.scale_height);
+
+        depth.add(rho, step_size);
+
+        double proj = v.z;
+        double orth = hypot(v.x, v.y);
+
+        double depth_to_sun = optical_depth_to_sun(p, d, proj, orth);
+        double scatter_in = rho * exp(-4 * M_PI * k * (depth_to_sun + depth.acc));
+
+        intensity.add(scatter_in, step_size);   
+
+        if (planet_distance >= p.atmos_bound)
+            return intensity.acc * p.ssi[c] * k;
+
+        step_size = exp(p.step_scale * h) / p.view_step;
+        v = v + r * step_size;
+    }    
+}
+
+static double sky_light_at(Params& p, Derived& d, double k, int c, double cos_a) {
+    double sin_a = sqrt(1 - cos_a*cos_a);
+
+    double acc = 0;
+    int n = 0;
+
+    // Select a point Q on the sphere.
+    Vec3 q(sin_a, 0, cos_a);
+
+    // Get the basis vectors for the hemisphere around Q.
+    Vec3 bx(-cos_a, 0, sin_a);
+    Vec3 by(0, 1, 0);
+    Vec3 bz(q); 
+
+    double y = p.sky_eval_step / 2;
+
+    while (y <= 1) {
+        double x = p.sky_eval_step / 2;
+
+        while (x*x + y*y <= 1) {
+            do {
+                Vec3 r = bx * x + by * y + bz * sqrt(1 - x*x - y*y);
+
+                acc += eval_from_surface(p, d, k, c, q, r);
+                n++;
+
+                x = -x;
+            } while (x < 0);
+
+            x += p.sky_eval_step;
+        }
+
+        y += p.sky_eval_step;
+    }
+
+    acc /= n;
+    return acc;
+}
+
+sky_table::sky_table(size_t samples) : values(samples, NAN) {};
+
+static double sky_get_or_compute(sky_table& table, Params& p, Derived& d, double k, int c, int cos_a_quant) {
+    if (cos_a_quant < 0)
+        cos_a_quant = 0;
+    if (cos_a_quant >= table.values.size())
+        cos_a_quant = table.values.size() - 1;
+    
+    if (isnan(table.values[cos_a_quant])) {
+        double cos_a = cos_a_quant * 2.0 / (table.values.size() - 1) - 1;
+        cos_a = cos_a*cos_a*cos_a;
+        table.values[cos_a_quant] = sky_light_at(p, d, k, c, cos_a);
+    }
+
+    return table.values[cos_a_quant];
+}
+
+static double sky_eval(sky_table& table, Params& p, Derived& d, double k, int c, double cos_a) {
+    double t = (table.values.size() - 1) * (1 + cbrt(cos_a)) / 2;
+
+    int tl = t;
+    int tr = tl + 1;
+
+    double tt = fmod(t, 1);
+
+    double vl = sky_get_or_compute(table, p, d, k, c, tl);
+    double vr = sky_get_or_compute(table, p, d, k, c, tr);
+
+    return vl + tt * (vr - vl);
+}
+
 static double compute(Params& p, Derived& d, double k, double x, double y, int c) {
     double bound_h_sq = d.b_sq - x * x - y * y;
 
@@ -321,15 +435,26 @@ static double compute(Params& p, Derived& d, double k, double x, double y, int c
         double orth = sqrt(v_v - proj*proj);
 
         double depth_to_sun = optical_depth_to_sun(p, d, proj, orth);
-        double scatter_in = rho * exp(4 * M_PI * k * -(depth_to_sun + depth.acc));
+        double scatter_in = rho * exp(-4 * M_PI * k * (depth_to_sun + depth.acc));
 
         intensity.add(scatter_in, step_size);   
 
         if (z == zf) {
-            if (hit)
-                intensity.acc += scatter_in * sample_texture(p, d, diffuse, c, v);
+            if (hit) {
+                double direct = scatter_in * std::max(proj, 0.);
+                double sky;
 
-            return p.ssi[c] * k * intensity.acc;
+                if (c == 0) sky = sky_eval(d.sky_r, p, d, k, c, proj);
+                else if (c == 1) sky = sky_eval(d.sky_g, p, d, k, c, proj);
+                else if (c == 2) sky = sky_eval(d.sky_b, p, d, k, c, proj);
+                else assert(false);
+
+                intensity.acc += (direct + sky) * sample_texture(p, d, diffuse, c, v);
+            }
+
+            intensity.acc *= p.ssi[c] * k;
+
+            return intensity.acc;
         };
 
         step_size = exp(p.step_scale * h) / p.view_step;
@@ -533,6 +658,11 @@ SDL_AppResult SDL_AppIterate(void *appstate) {
     dirty |= SliderDouble("Planet yaw", &params.planet_yaw, -M_PI, M_PI);
     dirty |= SliderDouble("Planet pitch", &params.planet_pitch, -M_PI, M_PI);
     dirty |= SliderDouble("Planet roll", &params.planet_roll, -M_PI, M_PI);
+    
+    ImGui::SeparatorText("Sky");
+
+    dirty |= ImGui::SliderInt("Lookup quantization", &params.sky_quant, 0, 1000);
+    dirty |= SliderDouble("Evaluation density", &params.sky_eval_step, 0., 1.);
 
     ImGui::SeparatorText("Camera");
     
