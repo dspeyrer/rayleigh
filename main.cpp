@@ -162,7 +162,7 @@ struct Params {
     // The solar irradiance of the colors of each channel.
     float ssi[3] = { 0.75, 0.85, 1.0 };
     // The color of the surface illuminants.
-    float surf_illum[3] = { 1.0, 1.0, 1.0 };
+    float surf_illum[3] = { 0.15, 0.15, 0.15 };
 
     int sky_quant = 100;
     double sky_eval_step = .05;
@@ -462,8 +462,13 @@ static double compute(Params& p, Derived& d, double k, double x, double y, int c
         intensity.add(scatter_in, step_size);   
 
         if (z == zf) {
+            intensity.acc *= p.ssi[c] * k;
+
             if (hit) {
-                double direct = scatter_in * std::max(proj, 0.);
+                double transmittance_to_sun = exp(-4 * M_PI * k * depth_to_sun);
+                double transmittance_to_viewpoint = exp(-4 * M_PI * k * depth.acc);
+
+                double direct = transmittance_to_sun * std::max(proj, 0.);
                 double sky;
 
                 if (c == 0) sky = sky_eval(d.sky_r, p, d, k, c, proj);
@@ -471,12 +476,11 @@ static double compute(Params& p, Derived& d, double k, double x, double y, int c
                 else if (c == 2) sky = sky_eval(d.sky_b, p, d, k, c, proj);
                 else assert(false);
 
-                intensity.acc += (direct + sky) * sample_texture(p, d, diffuse, c, v);
+                intensity.acc += transmittance_to_viewpoint * (direct + sky) * sample_texture(p, d, diffuse, c, v);
             }
 
-            intensity.acc *= p.ssi[c] * k;
 
-            if (hit)
+            if (hit && illuminants)
                 intensity.acc += p.surf_illum[c] * exp(-4 * M_PI * k * depth.acc) * sample_illuminants(p, d, c, v);
 
             return intensity.acc;
